@@ -37,16 +37,35 @@ with st.sidebar:
     st.divider()
     st.markdown("**Architecture:**\n- Isolated FAISS index per PDF\n- `gemini-embedding-001` vectors\n- `gemini-3.5-flash-lite` synthesis")
 
+def create_faiss_with_retry(chunks, embeddings, max_retries=3):
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            return FAISS.from_documents(chunks, embeddings)
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                match = re.search(r"retry in ([0-9]+(?:\.[0-9]+)?)s", err_str)
+                wait_sec = min(int(float(match.group(1))) + 2, 65) if match else 20 * (attempt + 1)
+                st.toast(f"Embedding rate limit reached. Waiting {wait_sec}s and retrying...")
+                time.sleep(wait_sec)
+            else:
+                raise
+    raise last_err
+
 def build_separate_retrievers(files, key, k_val):
     embeddings = GoogleGenerativeAIEmbeddings(
         model="models/gemini-embedding-001",
         google_api_key=key
     )
-    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=150)
     retrievers = {}
     stats = {"total_pages": 0, "total_chunks": 0, "per_doc": {}}
 
-    for file in files:
+    for idx, file in enumerate(files):
+        if idx > 0:
+            time.sleep(1.5)
         file.seek(0)
         reader = PdfReader(file)
         page_docs = []
@@ -60,7 +79,7 @@ def build_separate_retrievers(files, key, k_val):
                     )
                 )
         flat_chunks = [chunk for sublist in page_docs for chunk in sublist]
-        vectorstore = FAISS.from_documents(flat_chunks, embeddings)
+        vectorstore = create_faiss_with_retry(flat_chunks, embeddings)
         retrievers[file.name] = vectorstore.as_retriever(search_kwargs={"k": k_val})
 
         stats["total_pages"] += len(reader.pages)
@@ -209,11 +228,15 @@ else:
             file_signature = (tuple(file_names), top_k)
 
             if "retrievers" not in st.session_state or st.session_state.get("indexed_sig") != file_signature:
-                with st.spinner("Step 1/2: Building isolated FAISS vector indices per PDF..."):
-                    retrievers, doc_stats = build_separate_retrievers(uploaded_files, api_key, top_k)
-                    st.session_state.retrievers = retrievers
-                    st.session_state.doc_stats = doc_stats
-                    st.session_state.indexed_sig = file_signature
+                try:
+                    with st.spinner("Step 1/2: Building isolated FAISS vector indices per PDF..."):
+                        retrievers, doc_stats = build_separate_retrievers(uploaded_files, api_key, top_k)
+                        st.session_state.retrievers = retrievers
+                        st.session_state.doc_stats = doc_stats
+                        st.session_state.indexed_sig = file_signature
+                except Exception as e:
+                    st.error("Free-tier embedding quota temporarily reached. Please wait ~60 seconds and click Generate Comparison Output again.")
+                    st.stop()
 
             with st.spinner("Step 2/2: Retrieving chunks per PDF & synthesizing comparison matrix..."):
                 retrieved_sections = []
